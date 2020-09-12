@@ -71,7 +71,7 @@ class WebHDFSConfig(object):
       log_handler.setLevel(level)
       return log_handler
 
-  def get_client(self, cluster_name, **kwargs):
+  def get_client(self, cluster_name, auth_mechanism=None, **kwargs):
       """Load WebHDFS client.
 
       :param cluster_name: The client to look up. If the cluster name does not
@@ -85,10 +85,16 @@ class WebHDFSConfig(object):
         if cluster['name'] == cluster_name:
             # remove the name parameter from the 
             del cluster['name']
-            # set overwrite arguments            
+            
+            # get the authentication mechanism to use
+            auth_mech = auth_mechanism or cluster['auth_mechanism']
+            del cluster['auth_mechanism']
+
+            # set overwrite arguments
             for extra_option in kwargs:
               cluster[extra_option] = kwargs[extra_option]
-            return WebHDFSClient(**cluster)
+
+            return create_client(auth_mechanism=auth_mech, **cluster)
 
       # the name does not exist
       raise HdfsError('Cluster %s is not defined in configuration file.' % cluster_name)

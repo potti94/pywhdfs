@@ -52,10 +52,13 @@ setup(
   install_requires=[
     'docopt',
     'requests>=2.7.0',
-    'jsonschema>2.0',
+    'jsonschema>=2.0',
     'requests-kerberos>=0.7.0',
+    'pykerberos',
+    'python-krbV'
   ],
   entry_points={'console_scripts': 
      [ 'pywhdfs = pywhdfs.cmdtool:main' ]
   },
+  long_description_content_type='text/markdown'
 )

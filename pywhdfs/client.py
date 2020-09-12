@@ -6,17 +6,25 @@ from .utils import hglob
 from .utils.utils import *
 from contextlib import contextmanager
 from multiprocessing.pool import ThreadPool
-from threading import Lock, Semaphore
+from threading import Lock, Semaphore, BoundedSemaphore
+from subprocess import call
+from getpass import getuser
+from shutil import move, rmtree
 import requests as rq
 import logging as lg
 import itertools as it
 import glob
+import fnmatch
+import re
 import time
 import stat
 import grp
 import pwd
+import sys
+import os
 import posixpath as psp
 import os.path as osp
+from datetime import datetime
 
 try:
     # Python 3
@@ -26,6 +34,7 @@ except ImportError:  # pragma: no cover
     import httplib
 
 try:
+    import krbV
     import requests_kerberos
     from requests_kerberos import HTTPKerberosAuth
     KRB_LIB_IMPORT=True
@@ -35,11 +44,23 @@ except ImportError:
 _logger = lg.getLogger(__name__)
 
 webhdfs_prefix = '/webhdfs/v1'
-AUTH_MECHANISMS = ['NONE', 'GSSAPI', 'TOKEN']
-_delay = 0.001
+
+AUTH_MECHANISMS = ['NONE', 'GSSAPI', 'TOKEN', 'TKN_GSSAPI']
+
+def create_client(auth_mechanism, **kwargs):
+  if auth_mechanism == "NONE":
+    return InsecureWebHDFSClient(**kwargs)
+  elif auth_mechanism == "GSSAPI":
+    return KrbWebHDFSClient(**kwargs)
+  elif auth_mechanism == "TOKEN":
+    return TokenWebHDFSClient(**kwargs)
+  elif auth_mechanism == "TKN_GSSAPI":
+    return KrbTokenWebHDFSClient(**kwargs)
+  else:
+    raise NotSupportedError(
+      'Unsupported authentication mechanism: {0}'.format(auth_mechanism))
 
 class WebHDFSClient(object):
-
   """Web HDFS client.
 
   :param nameservices: List of dictionaries specifying the namenodes to connect to, each dict should be
@@ -62,62 +83,50 @@ class WebHDFSClient(object):
     details.
   :param verify: If the Namenode certificate should be verified or not when using SSL
      Could be a boolean True/False or a path a Truststore file.
-
   """
 
   def __init__(
            self,
            nameservices,
-           auth_mechanism="NONE",
-           mutual_auth='OPTIONAL',
-           max_concurrency=10,
-           user=None,
-           token=None,
+           max_concurrency=-1,
+           pool_connections=60,
            root=None,
            proxy=None,
            timeout=None,
            verify=False,
-           truststore=None
+           truststore=None,
+           session=None
        ):
-
-    if auth_mechanism not in AUTH_MECHANISMS:
-      raise NotSupportedError(
-          'Unsupported authentication mechanism: {0}'.format(auth_mechanism))
 
     # Comma separed list of namenodes urls
     self.host_list = SyncHostsList(nameservices)
     self.root = root
-    self._session = rq.Session()
 
-    if auth_mechanism == "NONE":
-      user = user or getuser()
-      if not self._session.params:
-        self._session.params = {}
-      self._session.params['user.name'] = user
-    elif auth_mechanism == "TOKEN":
-      if not self._session.params:
-        self._session.params = {}
-      self._session.params['delegation'] = token
-    else:
-      if KRB_LIB_IMPORT == False:
-        raise ImportError("Missing requests_kerberos library")
+    self.max_fail_retries = 10
+    self.on_fail_delay = 6 # Seconds
+
+    self._session = session or rq.Session()
+    # Use a bigger connection pool due to the big number of concurrent threads 
+    adapter = rq.adapters.HTTPAdapter(max_retries=5, pool_connections=pool_connections, pool_maxsize=pool_connections)
+    self._session.mount('http://', adapter)
+    self._session.mount('https://', adapter)
+
+    self.max_concurrency = int(max_concurrency)
+    if self.max_concurrency > 0:
       self._lock = Lock()
-      self._sem = Semaphore(int(max_concurrency))
-      self._timestamp = time.time() - _delay
-      if mutual_auth:
-        try:
-          _mutual_auth = getattr(requests_kerberos, mutual_auth)
-        except AttributeError:
-          raise HdfsError('Invalid mutual authentication type: %r', mutual_auth)
-      else:
-        _mutual_auth = mutual_auth
-      self._session.auth = HTTPKerberosAuth(_mutual_auth)
+      self._sem = Semaphore(int(self.max_concurrency))
+      # ensure there is a least _concurency_delay time difference between
+      # two consecutive requests, avoid flooding the namenode/datanode with requests
+      self._concurency_delay = 0.001 # Seconds.
+      self._timestamp = time.time() - self._concurency_delay
 
     if proxy:
       if not self._session.params:
         self._session.params = {}
       self._session.params['doas'] = proxy
+
     self._timeout = timeout
+    self.proxy = proxy
 
     if verify and truststore is not None:
       self._verify = truststore
@@ -133,8 +142,9 @@ class WebHDFSClient(object):
   def _api_request(self, method, params, hdfs_path, data=None, strict=True, **rqargs):
     """Wrapper function."""
     max_attemps = self.host_list.get_host_count(hdfs_path)
-    attempt = 1
-    while attempt <= max_attemps:
+    attempt = 0
+
+    while True:
       host = self.host_list.get_active_host(hdfs_path)
       url = '%s%s%s' % (
         host.rstrip('/'),
@@ -151,12 +161,17 @@ class WebHDFSClient(object):
           **rqargs
         )
         return response
+      ## Handle stanby failover
       except StandbyError, e:
-        _logger.info('Namenode %s in standby mode. %s', host, str(e))
+        _logger.warn('Namenode %s in standby mode. %s', host, str(e))
         self.host_list.switch_active_host(host,hdfs_path)
         attempt += 1
-        pass
-    raise StandbyError('Could not find any active namenode.')
+        if attempt >= max_attemps:
+          raise HdfsError('Could not find any active namenode.')
+        else:
+          pass
+
+    raise HdfsError('Inexpected Process End.')
 
   '''
     Generic Request handler, do not implement the failover controller for HA here
@@ -167,60 +182,126 @@ class WebHDFSClient(object):
     _logger.debug('Attempting %s request on url %s with parameters %s', method ,url, rqargs)
 
     def _on_fail(response, strict=True):
-      if response.status_code == httplib.UNAUTHORIZED:
-        _logger.error('Authentication Failure.')
-        raise HdfsError('Authentication failure. Check your credentials.')
 
-      if response.status_code == httplib.FORBIDDEN:
-        try:
-          exception = response.json()["RemoteException"]["exception"]
-        except:
-          exception = "ForbiddenException"
-          pass
-        if exception == "StandbyException":
-          _logger.info('Request returned Standby Exception on url %s.', response.url)
-          try:
-            _msg = response.json()['RemoteException']['message']
-          except:
-            _msg = response.content
-            pass
-          raise StandbyError("StandbyException : %r",_msg)
-        #else: we certainly know that it's a 403 error but not standby, just keep going
       try:
         message = response.json()['RemoteException']['message']
       except ValueError:
         # No clear one thing to display, display entire message content
         message = response.content
+      try:
+        exception = str(response.json()["RemoteException"]["exception"])
+      except ValueError:
+        exception = ""
 
+      if response.status_code == httplib.UNAUTHORIZED:
+        _logger.error('Authentication Failure.')
+        raise AuthenticationError('Authentication failure. Check your credentials.')
+
+      if response.status_code == httplib.REQUEST_TIMEOUT or response.status_code == httplib.GATEWAY_TIMEOUT:
+        _logger.warn('Failed %s request on url %s returned with status %s, Remote Exception : %s, Message: %s', response.request.method ,response.url, response.status_code, str(exception), str(message))
+        raise HdfsTimeoutError("TimeoutException : %r",message)
+
+      if response.status_code == httplib.FORBIDDEN:
+        _logger.warn('Failed %s request on url %s returned with status %s, Remote Exception : %s, Message: %s', response.request.method ,response.url, response.status_code, str(exception), str(message))
+        if exception == "SecurityException":
+          _logger.warn('Delegation token expired')
+          if "InvalidToken" in message:
+            raise InvalidTokenError("InvalidTokenException : %r",message)
+          else:
+            raise SecurityError("SecurityError : %r",message)
+          # else it is something else
+        elif exception == "InvalidToken":
+          _logger.warn('Delegation token expired')
+          raise InvalidTokenError("InvalidTokenException : %r",message)
+        elif exception == "StandbyException":
+          _logger.warn('Request returned Standby Exception on url %s.', response.url)
+          raise StandbyError("StandbyException : %r",message)
+        elif exception == "AlreadyBeingCreatedException":
+          _logger.warn('Request returned AlreadyBeingCreatedError on url %s.', response.url)
+          raise AlreadyBeingCreatedError("AlreadyBeingCreatedError : %r",message)
+        elif exception == "RecoveryInProgressException":
+          _logger.warn('Request returned RecoveryInProgressError on url %s.', response.url)
+          raise RecoveryInProgressError("RecoveryInProgressError : %r",message)
+        elif exception == "IOException":
+          _logger.warn('Request returned HdfsIOError on url %s.', response.url)
+          if "SocketTimeout" in str(message):
+             raise HdfsTimeoutError("TimeoutException : %r",message)
+          raise HdfsIOError("HdfsIOError : %r",message)
+        else:
+          # resolve the exception based on message, if the exception
+          # is unknown
+          if "SocketTimeout" in str(message):
+            raise HdfsTimeoutError("TimeoutException : %r",message)
+          elif re.match("token .* is expired",str(message)):
+            _logger.warn('Delegation token expired')
+            raise InvalidTokenError("InvalidTokenException : %r",str(message))
+          if strict:
+            raise ForbiddenRequestError("ForbiddenException : %r",message)
       if strict:
-        _logger.error('%s request on url %s returned with Remote Exception : %s', response.request.method ,response.url, str(message))
+        _logger.error('Failed %s request on url %s returned with status %s, Remote Exception : %s, Message: %s', response.request.method ,response.url, response.status_code, str(exception), str(message))
         raise HdfsError(message)
       else:
         _logger.debug('Ignoring Remote Exception for %s request on url %s : %s', response.request.method ,response.url, str(message))
         return response
 
-    if 'auth' in rqargs:
-      with self._sem:
-        with self._lock:
-          delay = self._timestamp + _delay - time.time()
-          if delay > 0:
-            time.sleep(delay) # Avoid replay errors.
-          self._timestamp = time.time()
+    retries = 0
+    while True:
+      if self.max_concurrency > 0:
+        # Control the number of parallel requests
+        with self._sem:
+          with self._lock:
+            # the current time need to exceed the last query time + a delay
+            delay = self._timestamp + self._concurency_delay - time.time()
+            if delay > 0:
+              time.sleep(delay) # Avoid replay errors.
+              self._timestamp = time.time() # last request time
+          response = self._session.request(
+            method=method,
+            url=url,
+            timeout=self._timeout,
+            verify=self._verify,
+            headers={'content-type': 'application/octet-stream'},
+            **rqargs
+          )
+      else:
+        response = self._session.request(
+          method=method,
+          url=url,
+          timeout=self._timeout,
+          verify=self._verify,
+          headers={'content-type': 'application/octet-stream'},
+          **rqargs
+        )
 
-    response = self._session.request(
-        method=method,
-        url=url,
-        timeout=self._timeout,
-        verify=self._verify,
-        headers={'content-type': 'application/octet-stream'},
-        **rqargs
-    )
-    _logger.debug('%s request on url %s returned with status %s', method ,url, response.status_code)
+      # returns True if status_code is less than 400
+      if not response:
+        try:
+          return _on_fail(response=response,strict=strict)
+        # recoverable errors
+        except (HdfsTimeoutError, RecoveryInProgressError, AlreadyBeingCreatedError, HdfsIOError) as e:
+          _logger.warn('Request failed %s', str(e))
+          retries += 1
+          if retries >= self.max_fail_retries:
+            raise HdfsError('Exceeded maximum number of retries after %s attemps, failing.')
+          else:
+            _logger.warn('Retrying failed request, attempt %s of %s', retries, self.max_fail_retries)
+            time.sleep(self.on_fail_delay)
+            pass
+      else:
+        _logger.debug('%s request on url %s returned with status %s', method ,url, response.status_code)
+        return response
 
-    if not response:
-      return _on_fail(response=response,strict=strict)
-    else:
-      return response
+  def help(self):
+    help(self)
+
+  def get_current_user(self):
+      if self.proxy:
+        return self.proxy
+      else:
+        return get_authenticated_user()
+
+  def get_authenticated_user(self):
+      return getuser()  
 
   def content(self, hdfs_path, strict=True):
     """Get ContentSummary_ for a file or folder on HDFS.
@@ -230,7 +311,7 @@ class WebHDFSClient(object):
     .. _ContentSummary: CS_
     .. _CS: http://hadoop.apache.org/docs/r1.0.4/webhdfs.html#ContentSummary
     """
-    _logger.info('Fetching content summary for %r.', hdfs_path)
+    _logger.debug('Fetching content summary for %r.', hdfs_path)
     res = self._api_request(method='GET', hdfs_path=hdfs_path, params={'op': 'GETCONTENTSUMMARY'}, strict=strict)
     return res.json()['ContentSummary'] if res else None
 
@@ -242,7 +323,7 @@ class WebHDFSClient(object):
     .. _FileStatus: FS_
     .. _FS: http://hadoop.apache.org/docs/r1.0.4/webhdfs.html#FileStatus
     """
-    _logger.info('Fetching status for %r.', hdfs_path)
+    _logger.debug('Fetching status for %r.', hdfs_path)
     res = self._api_request(method='GET', hdfs_path=hdfs_path, params={'op': 'GETFILESTATUS'}, strict=strict)
     return res.json()['FileStatus'] if res else None
 
@@ -256,7 +337,7 @@ class WebHDFSClient(object):
     This function returns `True` if the deletion was successful and `False` if
     no file or directory previously existed at `hdfs_path`.
     """
-    _logger.info(
+    _logger.debug(
       'Deleting %r%s.', hdfs_path, ' recursively' if recursive else ''
     )
     return self._api_request(method='DELETE', hdfs_path=hdfs_path, params={'op': 'DELETE', 'recursive': recursive}).json()['boolean']
@@ -269,7 +350,7 @@ class WebHDFSClient(object):
       a file, or if a parent destination directory is missing, this method will
       raise an :class:`HdfsError`.
     """
-    _logger.info('Renaming %r to %r.', hdfs_src_path, hdfs_dst_path)
+    _logger.debug('Renaming %r to %r.', hdfs_src_path, hdfs_dst_path)
     hdfs_dst_path = self.resolvepath(hdfs_dst_path)
     res = self._api_request(method='PUT', hdfs_path=hdfs_src_path, params={'op': 'RENAME', 'destination': hdfs_dst_path})
     if not res.json()['boolean']:
@@ -292,7 +373,7 @@ class WebHDFSClient(object):
       messages.append('owner to %r' % (owner, ))
     if group:
       messages.append('group to %r' % (group, ))
-    _logger.info('Changing %s of %r.', ', and'.join(messages), hdfs_path)
+    _logger.debug('Changing %s of %r.', ', and'.join(messages), hdfs_path)
     self._api_request(method='PUT', hdfs_path=hdfs_path, params={'op': 'SETOWNER', 'owner': owner, 'group': group})
 
   def set_permission(self, hdfs_path, permission):
@@ -300,7 +381,7 @@ class WebHDFSClient(object):
     :param hdfs_path: HDFS path.
     :param permission: New octal permissions string of file.
     """
-    _logger.info(
+    _logger.debug(
       'Changing permissions of %r to %r.', hdfs_path, permission
     )
     self._api_request(method='PUT', hdfs_path=hdfs_path, params={'op': 'SETPERMISSION', 'permission': permission})
@@ -318,7 +399,7 @@ class WebHDFSClient(object):
       msgs.append('access time to %r' % (access_time, ))
     if modification_time:
       msgs.append('modification time to %r' % (modification_time, ))
-    _logger.info('Updating %s of %r.', ' and '.join(msgs), hdfs_path)
+    _logger.debug('Updating %s of %r.', ' and '.join(msgs), hdfs_path)
     self._api_request(method='PUT',hdfs_path=hdfs_path, params={'op': 'SETTIMES', 'accesstime': access_time, 'modificationtime': modification_time})
 
   def set_replication(self, hdfs_path, replication):
@@ -327,7 +408,7 @@ class WebHDFSClient(object):
       will be raised if the path doesn't exist or points to a directory.
     :param replication: Replication factor.
     """
-    _logger.info(
+    _logger.debug(
       'Setting replication factor to %r for %r.', replication, hdfs_path
     )
     res = self._api_request(method='PUT',hdfs_path=hdfs_path, params={'op': 'SETREPLICATION', 'replication': replication})
@@ -344,35 +425,44 @@ class WebHDFSClient(object):
     This function currently has no return value as WebHDFS doesn't return a
     meaningful flag.
     """
-    _logger.info('Creating directories to %r.', hdfs_path)
+    _logger.debug('Creating directories to %r.', hdfs_path)
     self._api_request(method='PUT', hdfs_path=hdfs_path, params={'op': 'MKDIRS', 'permission': permission})
 
   def checksum(self, hdfs_path):
     """Get a remote file's checksum.
     :param hdfs_path: Remote path. Must point to a file.
     """
-    _logger.info('Getting checksum for %r.', hdfs_path)
+    _logger.debug('Getting checksum for %r.', hdfs_path)
     return self._api_request(method='GET',hdfs_path=hdfs_path, params={'op': 'GETFILECHECKSUM'}).json()['FileChecksum']
 
-  def list(self, hdfs_path, status=False):
+  def list(self, hdfs_path, status=False, glob=False):
     """Return names of files contained in a remote folder.
     :param hdfs_path: Remote path to a directory. If `hdfs_path` doesn't exist
       or points to a normal file, an :class:`HdfsError` will be raised.
-    :param status: Also return each file's corresponding FileStatus_.
+    :glob: Whether the path should be considered a glob expressions
+    :param status: Also return each file's corresponding FileStatus.
     """
-    _logger.info('Listing %r.', hdfs_path)
+    _logger.debug('Listing %r.', hdfs_path)
     hdfs_path = self.resolvepath(hdfs_path)
-    statuses = self._api_request(method='GET', hdfs_path=hdfs_path, params={'op': 'LISTSTATUS'}).json()['FileStatuses']['FileStatus']
-    if len(statuses) == 1 and (
-      not statuses[0]['pathSuffix'] or self.status(hdfs_path)['type'] == 'FILE'
-      # HttpFS behaves incorrectly here, we sometimes need an extra call to
-      # make sure we always identify if we are dealing with a file.
-    ):
-      raise HdfsError('%r is not a directory.', hdfs_path)
-    if status:
-      return [(s['pathSuffix'], s) for s in statuses]
+
+    if not glob:
+      statuses = self._api_request(method='GET', hdfs_path=hdfs_path, params={'op': 'LISTSTATUS'}).json()['FileStatuses']['FileStatus']
+      if len(statuses) == 1 and (
+        not statuses[0]['pathSuffix'] or self.status(hdfs_path)['type'] == 'FILE'
+        # HttpFS behaves incorrectly here, we sometimes need an extra call to
+        # make sure we always identify if we are dealing with a file.
+      ):
+        raise HdfsError('%r is not a directory.', hdfs_path)
+      if status:
+        return [(s['pathSuffix'], s) for s in statuses]
+      else:
+        return [s['pathSuffix'] for s in statuses]
     else:
-      return [s['pathSuffix'] for s in statuses]
+      files = [ hdfs_file for hdfs_file in hglob.iglob(self, hdfs_path) ]
+      if status:
+        return [(f, self.status(f)) for f in files]
+      else:
+        return files
 
   def walk(self, hdfs_path, depth=0, status=False):
     """Depth-first walk of remote filesystem.
@@ -386,7 +476,7 @@ class WebHDFSClient(object):
     list of directory names it contains, and `files` is the list of file names
     it contains.
     """
-    _logger.info('Walking %r (depth %r).', hdfs_path, depth)
+    _logger.debug('Walking %r (depth %r).', hdfs_path, depth)
 
     def _walk(dir_path, dir_status, depth):
       """Recursion helper."""
@@ -421,11 +511,11 @@ class WebHDFSClient(object):
     :param snapshotname: Name of the snapshot.
     """
     if snapshotname != None:
-      _logger.info('Creating a snapshot %r on hdfs path %r.', snapshotname, hdfs_path)
+      _logger.debug('Creating a snapshot %r on hdfs path %r.', snapshotname, hdfs_path)
     else:
-      _logger.info('Creating a snapshot on hdfs path %r.', hdfs_path)
+      _logger.debug('Creating a snapshot on hdfs path %r.', hdfs_path)
     res = self._api_request(method='PUT',hdfs_path=hdfs_path, params={'op': 'CREATESNAPSHOT', 'snapshotname': snapshotname})
-    _logger.info('Successfully Created snapshot for hdfs path %r on %r.', hdfs_path, res.json()['Path'])
+    _logger.debug('Successfully Created snapshot for hdfs path %r on %r.', hdfs_path, res.json()['Path'])
     return res.json()['Path']
 
   def delete_snapshot(self, hdfs_path, snapshotname):
@@ -433,9 +523,9 @@ class WebHDFSClient(object):
     :param hdfs_path: HDFS path to snapshot.
     :param snapshotname: Name of the snapshot to delete.
     """
-    _logger.info('Deleting snapshot %r on hdfs path %r.', snapshotname, hdfs_path)
+    _logger.debug('Deleting snapshot %r on hdfs path %r.', snapshotname, hdfs_path)
     self._api_request(method='DELETE', hdfs_path=hdfs_path, params={'op': 'DELETESNAPSHOT', 'snapshotname': snapshotname})
-    _logger.info('Successfully Deleted snapshot %r.', snapshotname)
+    _logger.debug('Successfully Deleted snapshot %r.', snapshotname)
 
   def rename_snapshot(self, hdfs_path, oldsnapshotname, snapshotname):
     """Create a Snapshot on a particular HDFS directory.
@@ -443,9 +533,9 @@ class WebHDFSClient(object):
     :param oldsnapshotname: Name of the snapshot to rename.
     :param snapshotname: New snapshot name.
     """
-    _logger.info('Renaming snapshot %r on hdfs path %r to %r.', oldsnapshotname, hdfs_path, snapshotname)
+    _logger.debug('Renaming snapshot %r on hdfs path %r to %r.', oldsnapshotname, hdfs_path, snapshotname)
     self._api_request(method='PUT',  hdfs_path=hdfs_path, params={'op': 'RENAMESNAPSHOT', 'oldsnapshotname': oldsnapshotname, 'snapshotname': snapshotname})
-    _logger.info('Successfully Renamed snapshot %r to %r.', oldsnapshotname, snapshotname)
+    _logger.debug('Successfully Renamed snapshot %r to %r.', oldsnapshotname, snapshotname)
 
   def list_snapshots(self, path):
     snapshots_path = self.resolvepath(path) + "/.snapshot"
@@ -466,10 +556,10 @@ class WebHDFSClient(object):
     :returns a list of extended attribute dictionnairies.
     """
     if key != None:
-      _logger.info('Fetching extended attribute %r status for %r.', key, hdfs_path)
+      _logger.debug('Fetching extended attribute %r status for %r.', key, hdfs_path)
       res = self._api_request(method='GET', hdfs_path=hdfs_path, strict=strict, params={'op': 'GETXATTRS', 'encoding': encoding, 'xattr.name' : key})
     else:
-      _logger.info('Fetching all extended attributes for %r.', hdfs_path)
+      _logger.debug('Fetching all extended attributes for %r.', hdfs_path)
       res = self._api_request(method='GET', hdfs_path=hdfs_path, strict=strict, params={'op': 'GETXATTRS', 'encoding': encoding})
     if res:
       xattrs = {}
@@ -484,7 +574,7 @@ class WebHDFSClient(object):
     :param hdfs_path: Remote path.
     :param strict: If `False`, return `None` rather than raise an exception if the path doesn't exist.
     """
-    _logger.info('Listing all extended attributes for %r.', hdfs_path)
+    _logger.debug('Listing all extended attributes for %r.', hdfs_path)
     res = self._api_request(method='GET', hdfs_path=hdfs_path, strict=strict, params={'op': 'LISTXATTRS'})
     return res.json()['XAttrNames'] if res else None
 
@@ -494,7 +584,7 @@ class WebHDFSClient(object):
     :param key: the name of the extended attribute to delete.
     :param strict: If `False`, does not fail if the attribute is not defined on that path.
     """
-    _logger.info('Removing extended attribute %r for path %r.', key , hdfs_path)
+    _logger.debug('Removing extended attribute %r for path %r.', key , hdfs_path)
     res = self._api_request(method='PUT', hdfs_path=hdfs_path, strict=strict, params={'op': 'REMOVEXATTR', 'xattr.name' : key})
     return True if res else False
 
@@ -505,15 +595,15 @@ class WebHDFSClient(object):
     :param value: extended attribute value.
     :param overwrite: If `False`, does not fail if the attribute is already defined on that path.
     """
-    _logger.info('Setting extended attribute %r for path %r.', key , hdfs_path)
+    _logger.debug('Setting extended attribute %r for path %r.', key , hdfs_path)
     try:
       self._api_request(method='PUT', hdfs_path=hdfs_path,  params={'op': 'SETXATTR','flag': 'CREATE', 'xattr.name' : key, 'xattr.value': value})
     except HdfsError, e:
       if "already exists" in str(e):
-        _logger.info('Looks like extended attribute %r already exist for path %r.', key , hdfs_path)
+        _logger.debug('Looks like extended attribute %r already exist for path %r.', key , hdfs_path)
         if overwrite:
           try:
-            _logger.info('Replacing extended attribute %r value on path %r.', key , hdfs_path)
+            _logger.debug('Replacing extended attribute %r value on path %r.', key , hdfs_path)
             self._api_request(method='PUT', hdfs_path=hdfs_path, params={'op': 'SETXATTR','flag': 'REPLACE', 'xattr.name' : key, 'xattr.value': value})
           except Exception, e:
             raise e
@@ -531,7 +621,7 @@ class WebHDFSClient(object):
     :param hdfs_path: Remote path.
     :param token: delegation token obtained earlier.
     """
-    _logger.info('Canceling Delegation Token %r.', token)
+    _logger.debug('Canceling Delegation Token %r.', token)
     self._api_request(method='PUT', hdfs_path="/", params={'op': 'CANCELDELEGATIONTOKEN', 'token': token})
 
   def renewDelegationToken(self, token):
@@ -540,7 +630,7 @@ class WebHDFSClient(object):
     :param token: delegation token obtained earlier.
     :returns: the new expiration time. ex: {"long":1450171469608}
     """
-    _logger.info('Renewing Delegation Token.')
+    _logger.debug('Renewing Delegation Token.')
     res = self._api_request(method='PUT', hdfs_path="/", params={'op': 'RENEWDELEGATIONTOKEN', 'token': token})
     return res.json()['long'] if res else None
 
@@ -552,7 +642,7 @@ class WebHDFSClient(object):
     :param hdfs_path: Remote path.
     :param renewer: The account name that is allowed to renew the token.
     """
-    _logger.info('Listing Delegation Token for renewer %r.', renewer)
+    _logger.debug('Listing Delegation Token for renewer %r.', renewer)
     try:
       res = self._api_request(method='GET', hdfs_path="/", params={'op': 'GETDELEGATIONTOKENS', 'renewer': renewer})
       return res.json()['Tokens'] if res else None
@@ -572,7 +662,7 @@ class WebHDFSClient(object):
     :param service: the service for this token
     :param kind: the kind of token
     """
-    _logger.info('Requesting Delegation Token for renewer %r.', renewer)
+    _logger.debug('Requesting Delegation Token for renewer %r.', renewer)
     res = self._api_request(method='GET', hdfs_path="/", params={'op': 'GETDELEGATIONTOKEN', 'service': service, 'kind': kind})
     return res.json()['Token'] if res else None
 
@@ -588,7 +678,7 @@ class WebHDFSClient(object):
       the path doesn't exist.
     :returns: boolean
     """
-    _logger.info('Checking access for %r.', hdfs_path)
+    _logger.debug('Checking access for %r.', hdfs_path)
     access = True
     try:
       res = self._api_request(method='GET', hdfs_path=hdfs_path, strict=strict, params={'op': 'CHECKACCESS'})
@@ -605,7 +695,7 @@ class WebHDFSClient(object):
     :param strict: If `False`, return `None` rather than raise an exception if
       the path doesn't exist.
     """
-    _logger.info('Fetching ACL status for %r.', hdfs_path)
+    _logger.debug('Fetching ACL status for %r.', hdfs_path)
     res = self._api_request(method='GET', hdfs_path=hdfs_path, strict=strict, params={'op': 'GETACLSTATUS'})
     return res.json()['AclStatus'] if res else None
 
@@ -616,7 +706,7 @@ class WebHDFSClient(object):
       must include entries for user, group, and others for compatibility with permission bits.
       example: user::rwx,group::r--,other::---.
     """
-    _logger.info('Replacing ACLS %r for %r.', aclspec, hdfs_path)
+    _logger.debug('Replacing ACLS %r for %r.', aclspec, hdfs_path)
     self._api_request(method='PUT', hdfs_path=hdfs_path, params={'op': 'SETACL', 'aclspec': aclspec})
 
   def setacls(self, path, entries, recursive=False, strict=False):
@@ -660,7 +750,7 @@ class WebHDFSClient(object):
     :param strict: If `False`, return `None` rather than raise an exception if
       the path doesn't exist.
     """
-    _logger.info('Removing ACLS for %r.', hdfs_path)
+    _logger.debug('Removing ACLS for %r.', hdfs_path)
     self._api_request(method='PUT', hdfs_path=hdfs_path, strict=strict, params={'op': 'REMOVEACL'})
 
   def removeDefaultAcl(self, hdfs_path, strict=True):
@@ -669,7 +759,7 @@ class WebHDFSClient(object):
     :param strict: If `False`, return `None` rather than raise an exception if
       the path doesn't exist.
     """
-    _logger.info('Removing default ACLS for %r.', hdfs_path)
+    _logger.debug('Removing default ACLS for %r.', hdfs_path)
     self._api_request(method='PUT', hdfs_path=hdfs_path, strict=strict, params={'op': 'REMOVEDEFAULTACL'})
 
   def removeAclEntries(self, hdfs_path, aclspec, strict=True):
@@ -679,7 +769,7 @@ class WebHDFSClient(object):
     :param strict: If `False`, return `None` rather than raise an exception if
       the path doesn't exist.
     """
-    _logger.info('Removing ACLS entry %r for %r.', aclspec, hdfs_path)
+    _logger.debug('Removing ACLS entry %r for %r.', aclspec, hdfs_path)
     self._api_request(method='PUT', hdfs_path=hdfs_path, strict=strict, params={'op': 'REMOVEACLENTRIES', 'aclspec': aclspec})
 
   def modifyAclEntries(self, hdfs_path, aclspec, strict=True):
@@ -692,7 +782,7 @@ class WebHDFSClient(object):
     :param strict: If `False`, return `None` rather than raise an exception if
       the path doesn't exist.
     """
-    _logger.info('Replacing ACLS %r for %r.', aclspec, hdfs_path)
+    _logger.debug('Replacing ACLS %r for %r.', aclspec, hdfs_path)
     self._api_request(method='PUT', hdfs_path=hdfs_path, strict=strict, params={'op': 'MODIFYACLENTRIES', 'aclspec': aclspec})
 
 
@@ -790,7 +880,7 @@ class WebHDFSClient(object):
       else:
         # local destination path does not exist
         if not osp.exists(osp.dirname(local_path)):
-          raise HdfsError('Parent directory of %r does not exist.', local_base_path)
+          raise HdfsError('Parent directory of %r does not exist.', local_path)
         local_base_path =  local_path
         temp_path = local_base_path
         download_tuple = dict({ 'local_path' : local_base_path, 'hdfs_path' : download, 'temp_path' : local_base_path})
@@ -867,9 +957,44 @@ class WebHDFSClient(object):
     _logger.debug("--- download finished in : %s seconds ---" % (time.time() - start_time))
     return local_path
 
+  def read_file(self, hdfs_path, offset=0, length=None, buffer_size=None, encoding=None):
+    _logger.debug('Reading file %r.', hdfs_path)
+    res = self._api_request(method='GET', hdfs_path=hdfs_path, params={'op': 'OPEN', 'offset': offset, 'length': length, 'buffersize': buffer_size})
+    try:
+      res.encoding = encoding
+      return res.content
+    finally:
+      res.close()
+      _logger.debug('Closed response for reading file %r.', hdfs_path)
+
+  def read_stream(self, hdfs_path, offset=0, length=None, buffer_size=None, encoding=None, chunk_size=1024, delimiter=None):
+    """Stream a file from HDFS.
+       This function is a generator that returns chunks of data of chunk_size.
+    """
+    if delimiter:
+      if not encoding:
+        raise ValueError('Delimiter splitting requires an encoding.')
+      if chunk_size:
+        raise ValueError('Delimiter splitting incompatible with chunk size.')
+    _logger.info('Reading file %r.', hdfs_path)
+    res = self._api_request(method='GET', hdfs_path=hdfs_path, params={'op': 'OPEN', 'offset': offset, 'length': length, 'buffersize': buffer_size}, stream=True)
+    try:
+      res.encoding = encoding
+      if delimiter:
+        for chunk in res.iter_lines(delimiter=delimiter, decode_unicode=True):
+          if chunk:
+            yield chunk
+      else:
+        for chunk in res.iter_content(chunk_size=chunk_size, decode_unicode=True):
+          if chunk:
+            yield chunk
+    finally:
+      res.close()
+      _logger.debug('Closed response for reading file %r.', hdfs_path)
+
   @contextmanager
   def read(self, hdfs_path, offset=0, length=None, buffer_size=None,
-    encoding=None, chunk_size=None, delimiter=None):
+    encoding=None, chunk_size=None, delimiter=None, progress=None):
     """Read a file from HDFS.
     :param hdfs_path: HDFS path.
     :param offset: Starting byte position.
@@ -892,12 +1017,14 @@ class WebHDFSClient(object):
         content = reader.read()
     This ensures that connections are always properly closed.
     """
+    if progress and not chunk_size:
+      raise ValueError('Progress callback requires a positive chunk size.')
     if delimiter:
       if not encoding:
         raise ValueError('Delimiter splitting requires an encoding.')
       if chunk_size:
         raise ValueError('Delimiter splitting incompatible with chunk size.')
-    _logger.info('Reading file %r.', hdfs_path)
+    _logger.debug('Reading file %r.', hdfs_path)
     res = self._api_request(method='GET', hdfs_path=hdfs_path, params={'op': 'OPEN', 'offset': offset, 'length': length, 'buffersize': buffer_size}, stream=True)
     try:
       if not chunk_size and not delimiter:
@@ -908,7 +1035,19 @@ class WebHDFSClient(object):
           data = res.iter_lines(delimiter=delimiter, decode_unicode=True)
         else:
           data = res.iter_content(chunk_size=chunk_size, decode_unicode=True)
-        yield data
+        if progress:
+          def reader(_hdfs_path, _progress):
+            """Generator that tracks progress."""
+            nbytes = 0
+            for chunk in data:
+              nbytes += len(chunk)
+              _progress(_hdfs_path, nbytes)
+              yield chunk
+            _progress(_hdfs_path, -1)
+
+          yield reader(hdfs_path, progress)
+        else:
+          yield data
     finally:
       res.close()
       _logger.debug('Closed response for reading file %r.', hdfs_path)
@@ -950,10 +1089,10 @@ class WebHDFSClient(object):
         raise ValueError('Cannot both overwrite and append.')
       if permission or blocksize or replication:
         raise ValueError('Cannot change file properties while appending.')
-      _logger.info('Appending to %r.', hdfs_path)
+      _logger.debug('Appending to %r.', hdfs_path)
       res = self._api_request(method='POST', hdfs_path=hdfs_path, params={'op': 'APPEND', 'buffersize': buffersize}, allow_redirects=False)
     else:
-      _logger.info('Writing to %r.', hdfs_path)
+      _logger.debug('Writing to %r.', hdfs_path)
       res = self._api_request(
                     method='PUT',
                     hdfs_path=hdfs_path,
@@ -980,8 +1119,8 @@ class WebHDFSClient(object):
         data=(c.encode(encoding) for c in data) if encoding else data,
     )
 
-  def upload(self, hdfs_path, local_path, overwrite=False, n_threads=1, preserve=False,
-    temp_dir=None, chunk_size=2 ** 16, progress=None, **kwargs):
+  def upload(self, hdfs_path, local_path, overwrite=False, n_threads=1, preserve=False, checksum=True,
+    temp_dir=None, chunk_size=2 ** 16, progress=None, include_pattern="*", files_only=False, min_size=0, **kwargs):
     """Upload a file or directory to HDFS.
 
     :param hdfs_path: Target HDFS path. If it already exists and is a
@@ -1011,6 +1150,8 @@ class WebHDFSClient(object):
       raise ValueError('Upload chunk size must be positive.')
 
     lock = Lock()
+    dircache = []
+
     _logger.info('Uploading %r to %r.', local_path, hdfs_path)
 
     def _preserve(_local_path, _hdfs_path):
@@ -1020,6 +1161,15 @@ class WebHDFSClient(object):
       self.set_owner(_hdfs_path, owner=pwd.getpwuid(localstat.st_uid).pw_name, group=grp.getgrgid(localstat.st_gid).gr_name)
       self.set_permission(_hdfs_path, permission=oct(stat.S_IMODE(localstat.st_mode)))
       self.set_times( _hdfs_path, access_time=int(localstat.st_atime * 1000), modification_time=int(localstat.st_mtime  * 1000))
+
+    def _upload_wrap(_path_tuple):
+      _local_path, _hdfs_path = _path_tuple
+      try:
+        status = _upload(_path_tuple)
+        return status
+      except Exception as exp:
+        _logger.exception('Error while uploading %r to %r. %s' % (_local_path,_hdfs_path,exp))
+        return { 'status': 'failed', 'src_path': _local_path, 'dest_path' : _hdfs_path }
 
     def _upload(_path_tuple):
       """Upload a single file."""
@@ -1039,29 +1189,82 @@ class WebHDFSClient(object):
         if _progress:
           _progress(_local_path, -1)
 
-      _local_path, _temp_path = _path_tuple
-      # Prevent race condition when creating directories
-      with lock:
-        if self.status(osp.dirname(_temp_path), strict=False) is None:
-          _logger.debug('Parent directory %r does not exist, creating recursively.', osp.dirname(_temp_path))
-          curpath = ''
-          root_dir = None
-          for dirname in osp.dirname(_temp_path).strip('/').split('/'):
-              curpath = '/'.join([curpath, dirname])
-              if self.status(curpath, strict=False) is None:
+      _local_path, _hdfs_path = _path_tuple
+      _tmp_path = ""
+
+      skip=False
+
+      dst_st=self.status(_hdfs_path,strict=False)
+
+      if dst_st == None:
+        # destination does not exist
+        _tmp_path=_hdfs_path
+      else:
+        # destination exist
+        if not overwrite:
+          raise HdfsError('Destination file exist and Missing overwrite parameter.')
+        _tmp_path = '%s.temp-%s' % (_hdfs_path, int(time.time()))
+
+        if checksum == True:
+          _local_path_size = osp.getsize(_local_path)
+          _hdfs_path_size = self.content(_hdfs_path)['length']
+          if int(_local_path_size) == int(_hdfs_path_size):
+            _logger.info('source %r and destination %r seems to be identical, skipping.', _local_path, _hdfs_path)
+            skip=True
+          else:
+            _logger.debug('source destination files does not seems to have the same checksum value.')
+        else:
+          _logger.debug('no checksum check will be performed, forcing file copy source %r to destination %r.', _local_path, _hdfs_path)
+
+
+      if not skip:
+        if osp.dirname(_tmp_path) not in dircache:
+          _logger.info('Parent directory %r does not exist, creating recursively.', osp.dirname(_tmp_path))
+          # Prevent race condition when creating directories
+          with lock:
+            if self.status(osp.dirname(_tmp_path), strict=False) is None:
+              curpath = ''
+              root_dir = None
+              for dirname in osp.dirname(_tmp_path).strip('/').split('/'):
+                curpath = '/'.join([curpath, dirname])
+                if self.status(curpath, strict=False) is None:
                   if root_dir is not None:
                     root_dir = curpath
                   self.makedirs(curpath)
+                  dircache.append(curpath)
                   if preserve:
-                    curr_local_path=osp.realpath( osp.join( _local_path,osp.relpath(curpath,_temp_path)) )
+                    curr_local_path=osp.realpath( osp.join( _local_path,osp.relpath(curpath,_tmp_path)) )
                     _preserve(curr_local_path,curpath)
+                else:
+                  dircache.append(curpath)
+            else:
+              dircache.append(osp.dirname(_tmp_path))
 
+        _logger.info('Uploading %r to %r.', _local_path, _tmp_path)
 
-      _logger.debug('Uploading %r to %r.', _local_path, _temp_path)
-      with open(_local_path, 'rb') as reader:
-        self.write(_temp_path, wrap(reader, chunk_size, progress), **kwargs)
-      if preserve:
-        _preserve(_local_path,_temp_path)
+        with open(_local_path, 'rb') as reader:
+          self.write(_tmp_path, wrap(reader, chunk_size, progress), **kwargs)
+
+        if _tmp_path != _hdfs_path:
+          _logger.info( 'Upload of %r complete. Moving from %r to %r.', _local_path, _tmp_path, _hdfs_path )
+          self.delete(_hdfs_path)
+          self.rename(_tmp_path, _hdfs_path)
+        else:
+          _logger.info(
+            'Upload of %r to %r complete.', _local_path, _hdfs_path
+          )
+
+        if preserve:
+          _preserve(_local_path,_tmp_path)
+
+        return { 'status': 'copied', 'src_path': _local_path, 'dest_path' : _hdfs_path }
+      else:
+        # file was skipped
+        if progress:
+          progress(_local_path, int(osp.getsize(_local_path)))
+          progress(_local_path, -1)
+        return { 'status': 'skipped', 'src_path': _local_path, 'dest_path' : _hdfs_path }
+
 
     # Normalise local and remote paths
     local_path = osp.normpath(local_path)
@@ -1075,7 +1278,6 @@ class WebHDFSClient(object):
       raise HdfsError('Cloud not resolve source path, either it does not exist or can not access it.', local_path)
 
     tuples = []
-    temp_path = None
     for upload in uploads:
       upload_tuple = dict()
       try:
@@ -1096,8 +1298,7 @@ class WebHDFSClient(object):
             # so we want the source to be renamed as destination
             # so do not add the basename
             hdfs_base_path =  hdfs_path
-            temp_path = hdfs_base_path
-            upload_tuple = dict({ 'local_path' : upload, 'hdfs_path' : hdfs_base_path, 'temp_path' : temp_path})
+            upload_tuple = dict({ 'local_path' : upload, 'hdfs_path' : hdfs_base_path})
       else:
         # Remote path exists.
         if status['type'] == 'FILE':
@@ -1106,37 +1307,25 @@ class WebHDFSClient(object):
             raise HdfsError('Remote path %r already exists.', hdfs_path)
           # the file is going to be deleted and the destination is going to be created with the same name
           hdfs_base_path = hdfs_path
-          remote_dpath, remote_name = osp.split(hdfs_base_path)
-          temp_dir = temp_dir or remote_dpath
-          temp_path = osp.join(temp_dir, '%s.temp-%s' % (remote_name, int(time.time())) )
-          _logger.debug(
-              'Upload destination %r already exists. Using temporary path %r.',
-              hdfs_base_path, temp_path
-          )
         else:
           # Remote path exists and is a directory.
-          try:
-            status = self.status(osp.join( hdfs_path, osp.basename(upload) ),strict=True)
-          except HdfsError as err:
-            if 'File does not exist' in str(err):
-              # destination does not exist, great !
-              hdfs_base_path =  osp.join( hdfs_path, osp.basename(upload) )
-              temp_path = hdfs_base_path
-              pass
+          if files_only == True:
+             hdfs_base_path = hdfs_path
           else:
-            # destination exists
-            hdfs_base_path = osp.join( hdfs_path, osp.basename(upload))
-            if not overwrite:
-              raise HdfsError('Remote path %r already exists.', hdfs_base_path)
+            try:
+              status = self.status(osp.join( hdfs_path, osp.basename(upload) ),strict=True)
+            except HdfsError as err:
+              if 'File does not exist' in str(err):
+                # destination does not exist, great !
+                hdfs_base_path =  osp.join( hdfs_path, osp.basename(upload) )
+                pass
+            else:
+              # destination exists
+              hdfs_base_path = osp.join( hdfs_path, osp.basename(upload))
+              if not overwrite:
+                raise HdfsError('Remote path %r already exists.', hdfs_base_path)
 
-            remote_dpath, remote_name = osp.split(hdfs_base_path)
-            temp_dir = temp_dir or remote_dpath
-            temp_path = osp.join(temp_dir, '%s.temp-%s' % (remote_name, int(time.time())) )
-            _logger.debug(
-              'Upload destination %r already exists. Using temporary path %r.',
-              hdfs_base_path, temp_path
-            )
-        upload_tuple = dict({ 'local_path' : upload, 'hdfs_path' : hdfs_base_path, 'temp_path' : temp_path})
+        upload_tuple = dict({ 'local_path' : upload, 'hdfs_path' : hdfs_base_path})
       finally:
         tuples.append(upload_tuple)
 
@@ -1151,23 +1340,49 @@ class WebHDFSClient(object):
 
     fpath_tuples = []
     for upload_tuple in tuples:
-      # Then we figure out which files we need to upload, and where.
+      # Then we figure out which files we need to upload, and where.   
       if osp.isdir(upload_tuple['local_path']):
-        local_fpaths = [
-          osp.join(dpath, fpath)
-          for dpath, _, fpaths in os.walk(upload_tuple['local_path'])
-          for fpath in fpaths
-        ]
+        local_fpaths = []
+        for dpath, _, fpaths in os.walk(upload_tuple['local_path']):
+          for fpath in fpaths:
+            if fnmatch.fnmatch(fpath, include_pattern):
+              if osp.getsize(osp.join(dpath, fpath)) >= int(min_size):
+                local_fpaths.append(osp.join(dpath, fpath))
 
-        offset = len(upload_tuple['local_path'].rstrip(os.sep)) + len(os.sep)
-        fpath_tuples.extend([
-          (fpath, osp.join(upload_tuple['temp_path'], fpath[offset:].replace(os.sep, '/')))
-          for fpath in local_fpaths
-        ])
+        if files_only == False:
+          offset = len(upload_tuple['local_path'].rstrip(os.sep)) + len(os.sep)
+          fpath_tuples.extend([
+            (fpath, osp.join(upload_tuple['hdfs_path'], fpath[offset:].replace(os.sep, '/')))
+            for fpath in local_fpaths
+          ])
+        else:
+          fpath_tuples.extend([
+            (fpath, osp.join(upload_tuple['hdfs_path'], osp.basename(fpath)))
+            for fpath in local_fpaths
+          ])
       elif osp.exists(upload_tuple['local_path']):
-        fpath_tuples.append((upload_tuple['local_path'], upload_tuple['temp_path']))
+        fpath_tuples.append((upload_tuple['local_path'], upload_tuple['hdfs_path']))
       else:
         raise HdfsError('Local path %r does not exist.', upload_tuple['local_path'])
+
+    _logger.info("--- scan finished in %s seconds, uploading %s files ---" % (time.time() - start_time, len(fpath_tuples)))
+
+    if len(fpath_tuples) == 0:
+      end_time = time.time()
+      _logger.warn("could not find any file to upload")
+      return {
+        'Source Path'      : local_path,
+        'Destination Path' : hdfs_path,
+        'Start Time'       : datetime.fromtimestamp(start_time).strftime('%Y-%m-%d %H:%M:%S'),
+        'End Time'         : datetime.fromtimestamp(end_time).strftime('%Y-%m-%d %H:%M:%S'),
+        'Duration'         : end_time - start_time,
+        'Outcome'          : 'Successful',
+        'Files Expected'   : 0,
+        'Files Copied'     : 0,
+        'Files Failed'     : 0,
+        'Files Deleted'    : 0,
+        'Files Skipped'    : 0,
+      }
 
     # Finally, we upload all files (optionally, in parallel).
     if n_threads <= 0:
@@ -1179,35 +1394,45 @@ class WebHDFSClient(object):
     )
     try:
       if n_threads == 1:
+        results = []
         for path_tuple in fpath_tuples:
-          _upload(path_tuple)
+          results.append( _upload_wrap(path_tuple) )
       else:
-        _map_async(n_threads, _upload, fpath_tuples)
+        results = _map_async(n_threads, _upload_wrap, fpath_tuples)
     except Exception as err: # pylint: disable=broad-except
       _logger.exception('Error while uploading. Attempting cleanup.')
-      try:
-        for upload_tuple in tuples:
-          self.delete(upload_tuple['temp_path'], recursive=True)
-      except Exception, e:
-        _logger.error('Unable to cleanup temporary folder.')
-      finally:
-        raise err
-    else:
-      for upload_tuple in tuples:
-        if upload_tuple['temp_path'] != upload_tuple['hdfs_path']:
-          _logger.debug(
-            'Upload of %r complete. Moving from %r to %r.',
-            upload_tuple['local_path'], upload_tuple['temp_path'], upload_tuple['hdfs_path']
-          )
-          self.delete(upload_tuple['hdfs_path'], recursive=True)
-          self.rename(upload_tuple['temp_path'], upload_tuple['hdfs_path'])
-        else:
-          _logger.debug(
-            'Upload of %r to %r complete.', upload_tuple['local_path'], upload_tuple['hdfs_path']
-          )
+      raise err
 
-    _logger.debug("--- upload finished in : %s seconds ---" % (time.time() - start_time))
-    return [ (upload_tuple['hdfs_path'],upload_tuple['local_path']) for upload_tuple in tuples ]
+    _logger.info("--- upload finished in : %s seconds ---" % (time.time() - start_time))
+
+    end_time = time.time()
+
+    # Transfer summary
+    status = {
+      'Source Path'      : local_path,
+      'Destination Path' : hdfs_path,
+      'Start Time'       : datetime.fromtimestamp(start_time).strftime('%Y-%m-%d %H:%M:%S'),
+      'End Time'         : datetime.fromtimestamp(end_time).strftime('%Y-%m-%d %H:%M:%S'),
+      'Duration'         : end_time - start_time,
+      'Outcome'          : 'Successful',
+      'Files Expected'   : 0,
+      'Files Copied'     : 0,
+      'Files Failed'     : 0,
+      'Files Deleted'    : 0,
+      'Files Skipped'    : 0,
+    }
+
+    for result in results:
+      status['Files Expected']+=1
+      if result['status'] == 'copied':
+        status['Files Copied']+=1
+      if result['status'] == 'skipped':
+        status['Files Skipped']+=1
+      if result['status'] == 'failed':
+        status['Files Failed']+=1
+        status['Outcome'] = 'Failed'
+
+    return status
 
   # be careful the original resolve function provided with hdfs module does not seems to work
   # well with patterns, use this instead.
@@ -1258,6 +1483,141 @@ class WebHDFSClient(object):
             except Exception, e:
                 raise HdfsError(str(e))
         return True
+
+
+class InsecureWebHDFSClient(WebHDFSClient):
+
+  def __init__(self, nameservices, user=None, **kwargs):
+    self.user = user or getuser()
+    session = kwargs.setdefault('session', rq.Session())
+    if not session.params:
+      session.params = {}
+    session.params['user.name'] = self.user
+    super(InsecureWebHDFSClient, self).__init__(nameservices, **kwargs)
+
+  def get_authenticated_user(self):
+      return self.user
+
+class KrbWebHDFSClient(WebHDFSClient):
+
+  def __init__(self, nameservices, mutual_auth='DISABLED', **kwargs):
+    session = kwargs.setdefault('session', rq.Session())
+    if KRB_LIB_IMPORT == False:
+        raise ImportError("Missing requests_kerberos library")
+    if mutual_auth:
+        try:
+          _mutual_auth = getattr(requests_kerberos, mutual_auth)
+        except AttributeError:
+          raise HdfsError('Invalid mutual authentication type: %r', mutual_auth)
+    else:
+        _mutual_auth = mutual_auth
+    session.auth = HTTPKerberosAuth(_mutual_auth)
+
+    # get the authenticated user
+    ctx = krbV.default_context()
+    cc = ctx.default_ccache()
+    try:
+      self.principal = cc.principal().name
+    except krbV.Krb5Error, e:
+      raise HdfsError('Could not find any valid ticket in cache, %s', e)
+
+    super(KrbWebHDFSClient, self).__init__(nameservices, **kwargs)
+
+  def get_authenticated_user(self):
+      # get the authenticated user
+      return self.principal
+
+class TokenWebHDFSClient(WebHDFSClient):
+
+  def __init__(self, nameservices, token, **kwargs):
+      session = kwargs.setdefault('session', rq.Session())
+      if not session.params:
+        session.params = {}
+      session.params['delegation'] = token
+      super(TokenWebHDFSClient, self).__init__(nameservices, **kwargs)
+
+  def get_authenticated_user(self):
+      # There is no way to fetch who is the authenticated user with token.
+      return None
+
+class KrbTokenWebHDFSClient(WebHDFSClient):
+
+  def __init__(self, nameservices, mutual_auth='DISABLED', **kwargs):
+      session = kwargs.setdefault('session', rq.Session())
+      if not session.params:
+        session.params = {}
+      # try to create a renewer
+      try:
+        self.renewer = KrbWebHDFSClient( nameservices=nameservices, mutual_auth=mutual_auth, **kwargs)
+      except HdfsError, e:
+        _logger.error('Could not create a token renewer: %s',str(e))
+        raise e
+      # try to create a token
+      try:
+        _logger.info('Create delegation token, for user %s', self.renewer.get_authenticated_user())
+        self.token = self.renewer.getDelegationToken(renewer=self.renewer.get_authenticated_user())['urlString']
+      except HdfsError, e:
+        _logger.error('Could not create a delegation token, %s', str(e))
+        raise e
+      session.params['delegation'] = self.token
+      super(KrbTokenWebHDFSClient, self).__init__(nameservices, **kwargs)
+
+  def __del__(self):
+    try:
+      _logger.info('Cleanup created delegation token.')
+      self.renewer.cancelDelegationToken(token=self.token)
+    except HdfsError, e:
+      _logger.error('Could not cancel delegation token : %s', str(e))
+
+  def _api_request(self, method, params, hdfs_path, data=None, strict=True, **rqargs):
+    """Wrapper function."""
+    max_attemps = self.host_list.get_host_count(hdfs_path)
+    attempt = 0
+    renew_attempted = False
+
+    while True:
+      host = self.host_list.get_active_host(hdfs_path)
+      url = '%s%s%s' % (
+        host.rstrip('/'),
+        webhdfs_prefix,
+        self.resolvepath(hdfs_path),
+      )
+      try:
+        response = self._request(
+          method=method,
+          url=url,
+          strict=strict,
+          data=data,
+          params=params,
+          **rqargs
+        )
+        return response
+      ## Handle stanby failover
+      except StandbyError, e:
+        _logger.warn('Namenode %s in standby mode. %s', host, str(e))
+        self.host_list.switch_active_host(host,hdfs_path)
+        attempt += 1
+        if attempt >= max_attemps:
+          raise HdfsError('Could not find any active namenode.')
+        else:
+          pass
+      except InvalidTokenError, e:
+        if renew_attempted == True:
+          raise HdfsError('Could not renew Delegation Token ' % e)
+        try:
+          _logger.info('Renewing delegation token.')
+          self.renewer.renewDelegationToken(token=self.token)
+          renew_attempted = True
+        except Exception, e2:
+          raise HdfsError('Could not renew Delegation Token ' % e2)
+    raise HdfsError('Inexpected Process End.')
+
+    def get_authenticated_user(self):
+      if self.created_token:
+        return self.renewer.get_authenticated_user()
+      else:
+        # There is no way to fetch who is the authenticated user with token.
+        return None
 
 # Helpers
 # -------
